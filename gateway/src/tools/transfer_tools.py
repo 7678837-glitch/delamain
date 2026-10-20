@@ -172,6 +172,22 @@ def register_transfer_tools(mcp):
 # here is the one-time X-Transfer-Token itself, exactly as it is on the Java
 # side (see TransferRoutes.java).
 
+def _reject_token_in_query(request: Request) -> Optional[Response]:
+    """Issue #8: the transfer token is a bearer credential and is accepted only in the
+    X-Transfer-Token header. A ``?token=`` query parameter is refused with 400 and never
+    forwarded to the backend (the Java side refuses it too), so a client that puts the
+    token in the URL fails loudly instead of leaking it into logs on every call."""
+    if "token" not in request.query_params:
+        return None
+    return JSONResponse(
+        {
+            "error": "token_in_query_not_allowed",
+            "message": "send the transfer token in the X-Transfer-Token header, not in the URL",
+        },
+        status_code=400,
+    )
+
+
 def _backend_url_or_error():
     """Returns (base_url, None) or (None, JSONResponse) if no backend is configured."""
     inst = InstanceRegistry.get_default()
@@ -191,6 +207,10 @@ async def _proxy_transfer_upload(request: Request) -> Response:
     base, error = _backend_url_or_error()
     if error is not None:
         return error
+
+    rejected = _reject_token_in_query(request)
+    if rejected is not None:
+        return rejected
 
     headers = {
         name: value
@@ -231,21 +251,20 @@ async def _proxy_transfer_status(request: Request) -> Response:
     if error is not None:
         return error
 
+    rejected = _reject_token_in_query(request)
+    if rejected is not None:
+        return rejected
+
     headers = {}
     token_header = request.headers.get("X-Transfer-Token")
     if token_header is not None:
         headers["X-Transfer-Token"] = token_header
-    params = {}
-    token_query = request.query_params.get("token")
-    if token_query:
-        params["token"] = token_query
 
     client = await get_http_client()
     try:
         backend_resp = await client.get(
             f"{base}/transfer/status",
             headers=headers,
-            params=params,
             timeout=httpx.Timeout(TIMEOUT_METADATA),
         )
         return Response(
