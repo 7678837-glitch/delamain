@@ -66,8 +66,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # SAF-90: mask ?token= (and similar) query values in every log line that carries
-    # a URL — uvicorn's access log and httpx's outgoing-request log (src/log_redaction.py).
+    # SAF-90: mask ?token= (and similar) URL parameter values in uvicorn's access log
+    # and httpx's outgoing-request log (src/log_redaction.py; see its docstring for
+    # what is not covered). Only effective on this launch path: serving the app with
+    # a plain `uvicorn` command would bypass the log_config passed below.
     from src.log_redaction import install_log_redaction, uvicorn_log_config
     install_log_redaction()
 

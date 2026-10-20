@@ -10,9 +10,13 @@ import io
 import logging
 import sys
 import threading
+import time
 
 import httpx
 import pytest
+from uvicorn.logging import AccessFormatter
+
+import main
 from src.log_redaction import (
     MASK,
     QueryParamRedactionFilter,
@@ -20,9 +24,6 @@ from src.log_redaction import (
     redact_query_params,
     uvicorn_log_config,
 )
-from uvicorn.logging import AccessFormatter
-
-import main
 
 FAKE = "FAKE-SECRET-123"
 
@@ -45,10 +46,10 @@ FAKE = "FAKE-SECRET-123"
         (f"/x?access%5Ftoken={FAKE}", f"/x?access%5Ftoken={MASK}"),
         # repeated parameter: every occurrence is masked
         (f"/x?token={FAKE}&token=other-{FAKE}", f"/x?token={MASK}&token={MASK}"),
-        # full URL (httpx log line) and fragment are preserved
+        # full URL (httpx log line)
         (
             f"http://127.0.0.1:8650/transfer/status?token={FAKE}#frag",
-            f"http://127.0.0.1:8650/transfer/status?token={MASK}#frag",
+            f"http://127.0.0.1:8650/transfer/status?token={MASK}",  # '#' is part of the value (M1)
         ),
         # --- L5 (Elliot, #19 review): case variants and odd forms of the name ---
         (f"/x?Token={FAKE}", f"/x?Token={MASK}"),
@@ -61,26 +62,44 @@ FAKE = "FAKE-SECRET-123"
         (f"/x?token[0]={FAKE}", f"/x?token[0]={MASK}"),
         (f"/x?token%5B%5D={FAKE}", f"/x?token%5B%5D={MASK}"),
         (f"/x?api_key[]={FAKE}", f"/x?api_key[]={MASK}"),
-        # ';' as query separator, separators preserved as written
-        (f"/x?a=1;token={FAKE};b=2", f"/x?a=1;token={MASK};b=2"),
+        # ';' as a name boundary (L5); the value is masked to the next '&', because
+        # that is where the server (Starlette parse_qsl) ends it (L1)
+        (f"/x?a=1;token={FAKE};b=2", f"/x?a=1;token={MASK}"),
         (f"/x?a=1&b=2;Token={FAKE}&c=3", f"/x?a=1&b=2;Token={MASK}&c=3"),
         # matrix parameters in the path, with or without a query string
         (f"/transfer/status;token={FAKE}", f"/transfer/status;token={MASK}"),
         (f"/transfer/status;token={FAKE}?foo=bar", f"/transfer/status;token={MASK}?foo=bar"),
-        (f"/a;v=1;Token={FAKE}/b;x=2", f"/a;v=1;Token={MASK}/b;x=2"),
-        (f"/a;%74oken={FAKE}#frag", f"/a;%74oken={MASK}#frag"),
+        (f"/a;v=1;Token={FAKE}/b;x=2", f"/a;v=1;Token={MASK};x=2"),  # value runs past '/' (L1)
+        (f"/a;%74oken={FAKE}#frag", f"/a;%74oken={MASK}"),
         # ...and as uvicorn's access log prints them: quote(path) turns ";" / "="
         # into %3B / %3D
         (f"/transfer/status%3Btoken%3D{FAKE}", f"/transfer/status%3Btoken%3D{MASK}"),
-        (f"/a%3bv%3d1%3BToken%3D{FAKE}/b?foo=bar", f"/a%3bv%3d1%3BToken%3D{MASK}/b?foo=bar"),
+        (f"/a%3bv%3d1%3BToken%3D{FAKE}/b?foo=bar", f"/a%3bv%3d1%3BToken%3D{MASK}?foo=bar"),
         # a name sent as "%74oken" in the path is logged double-encoded by uvicorn
         (f"/a%3B%2574oken%3D{FAKE}", f"/a%3B%2574oken%3D{MASK}"),
         (f"/x?%2574oken={FAKE}", f"/x?%2574oken={MASK}"),
         # repeated, mixing every form above
         (
             f"/x?token={FAKE}&Token=b-{FAKE}&token[]=c-{FAKE};%74oken=d-{FAKE}&keep=1",
-            f"/x?token={MASK}&Token={MASK}&token[]={MASK};%74oken={MASK}&keep=1",
+            f"/x?token={MASK}&Token={MASK}&token[]={MASK}&keep=1",
         ),
+        # --- M1: '#' is not a fragment for the gateway (h11 keeps it in the query
+        # string, Starlette parses params after it), so no special handling ---
+        (f"/transfer/status?a=1#z&token={FAKE}", f"/transfer/status?a=1#z&token={MASK}"),
+        (f"/x?token=A#{FAKE}&b=1", f"/x?token={MASK}&b=1"),
+        (f"/x?token=A#B{FAKE}", f"/x?token={MASK}"),
+        (f"http://127.0.0.1:8650/x?a=1#f&token={FAKE}", f"http://127.0.0.1:8650/x?a=1#f&token={MASK}"),
+        # --- L1: the whole value is masked ---
+        (f"/x?token=A;{FAKE}&c=1", f"/x?token={MASK}&c=1"),
+        (f"/x?token=;{FAKE}", f"/x?token={MASK}"),
+        (f"/a;token=AAA/{FAKE}?x=1", f"/a;token={MASK}?x=1"),
+        (f"/a%3Btoken%3DAAA/{FAKE}%3Bv%3D1/c", f"/a%3Btoken%3D{MASK}%3Bv%3D1/c"),
+        (f"/a;sig=AAA/{FAKE};v=1", f"/a;sig={MASK};v=1"),
+        (f"/a;token=/{FAKE}", f"/a;token={MASK}"),
+        # --- L5 additions: more names, '-' treated as '_' ---
+        (f"/x?refresh_token={FAKE}&id_token={FAKE}", f"/x?refresh_token={MASK}&id_token={MASK}"),
+        (f"/x?auth_token={FAKE}&secret={FAKE}&a=1", f"/x?auth_token={MASK}&secret={MASK}&a=1"),
+        (f"/x?Access-Token={FAKE}&api-key={FAKE}", f"/x?Access-Token={MASK}&api-key={MASK}"),
         # value containing '=' is masked completely
         (f"/x?token={FAKE}==&b=2", f"/x?token={MASK}&b=2"),
     ],
@@ -102,7 +121,6 @@ def test_redact_query_params_masks_sensitive_values(raw, expected):
         # empty value / flag without '=': nothing to hide, left as written
         "/x?token=&a=1",
         "/x?token[]=&a=1",
-        "/a;token=/b",
         # matrix params / ';' separators without a sensitive name
         "/a;jsessionid=abc/b?x=1",
         "/a;b",
@@ -110,6 +128,12 @@ def test_redact_query_params_masks_sensitive_values(raw, expected):
         "/caf%C3%A9/%3B",
         "/x?a=1;b=2",
         "/x?tokenx[]=1&my[token]=2",
+        # names that contain a sensitive word but are legitimate elsewhere
+        "/x?max_tokens=5&token_type=bearer&secrets_dir=a&key=app_name",
+        # 4th encoding layer: not "token" for the server either (documented)
+        "/x?%25252574oken=1",
+        # over-long names are not decoded and treated as non-sensitive
+        "/x?" + "%25" * 200 + "74oken=1",
         "/x?token&a=1",
         "?",
         "",
@@ -176,9 +200,10 @@ def test_uvicorn_log_config_keeps_uvicorn_defaults_and_adds_filter():
 
     config = uvicorn_log_config()
     assert config["filters"]["delamain_redact_query"]["()"] is QueryParamRedactionFilter
-    assert "delamain_redact_query" in config["handlers"]["access"]["filters"]
-    assert "delamain_redact_query" in config["handlers"]["default"]["filters"]
-    assert "delamain_redact_query" in config["loggers"]["uvicorn.access"]["filters"]
+    # exactly one attachment per record path (H1): the access logger, the default handler
+    assert "filters" not in config["handlers"]["access"]
+    assert config["handlers"]["default"]["filters"] == ["delamain_redact_query"]
+    assert config["loggers"]["uvicorn.access"]["filters"] == ["delamain_redact_query"]
     # same formatters/streams/levels as uvicorn's default; the default is not mutated
     assert config["formatters"] == LOGGING_CONFIG["formatters"]
     assert config["handlers"]["access"]["stream"] == LOGGING_CONFIG["handlers"]["access"]["stream"]
@@ -188,13 +213,10 @@ def test_uvicorn_log_config_keeps_uvicorn_defaults_and_adds_filter():
     # and dictConfig/uvicorn accept it (exercised for real in the e2e test)
     import uvicorn
 
-    uvicorn.Config(app=lambda *a: None, log_config=config).configure_logging()
+    uvicorn.Config(app=lambda *a: None, log_config=config)  # __init__ applies dictConfig
     try:
         access = logging.getLogger("uvicorn.access")
-        assert any(isinstance(f, QueryParamRedactionFilter) for f in access.filters)
-        assert all(
-            any(isinstance(f, QueryParamRedactionFilter) for f in h.filters) for h in access.handlers
-        )
+        assert sum(isinstance(f, QueryParamRedactionFilter) for f in access.filters) == 1
     finally:
         logging.getLogger("uvicorn.access").filters.clear()
 
@@ -240,8 +262,9 @@ def test_install_log_redaction_masks_real_httpx_request_log(isolated_root_handle
     install_log_redaction()
     install_log_redaction()  # idempotent
     assert sum(isinstance(f, QueryParamRedactionFilter) for f in handler.filters) == 1
+    # uvicorn.access does not propagate to root; it gets its filter from uvicorn_log_config()
     access = logging.getLogger("uvicorn.access")
-    assert sum(isinstance(f, QueryParamRedactionFilter) for f in access.filters) == 1
+    assert not any(isinstance(f, QueryParamRedactionFilter) for f in access.filters)
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -291,4 +314,83 @@ def test_main_passes_redacting_log_config_to_uvicorn(monkeypatch):
     assert captured["transport"] == "http"
     uv = captured["uvicorn_config"]
     assert uv["log_level"] == fastmcp.settings.log_level.lower()
-    assert "delamain_redact_query" in uv["log_config"]["handlers"]["access"]["filters"]
+    assert uv["log_config"]["loggers"]["uvicorn.access"]["filters"] == ["delamain_redact_query"]
+
+
+# ---------------------------------------------------------------------------
+# H1 (Elliot, PR #20 review): the filter runs synchronously on the single event
+# loop for every access-log line and the request target is unauthenticated input,
+# so redaction must stay linear. 100K-char inputs (h11 caps a request line at 16 KB)
+# must each take well under a second; the quadratic array-suffix regex took ~4 s.
+# ---------------------------------------------------------------------------
+
+_BIG = 100_000
+
+
+_LINEAR_CASES = [
+        ("query name of '['", "/x?" + "[" * _BIG + "=1"),
+        ("query name of '[' then ']'", "/x?" + "[" * _BIG + "]=1"),
+        ("query of ';'", "/x?" + ";" * _BIG + "=1"),
+        ("query of '&'", "/x?" + "&" * _BIG + "token=1"),
+        ("query of '%25'", "/x?" + "%25" * (_BIG // 3) + "=1"),
+        ("many short params", "/x?" + "a=1&" * (_BIG // 4) + f"token={FAKE}"),
+        ("many '[' params", "/x?" + "[=1&" * (_BIG // 4)),
+        ("path of '['", "/" + "[" * _BIG),
+        ("matrix name of '['", "/a;" + "[" * _BIG + "=1"),
+        ("matrix of ';'", "/a" + ";" * _BIG),
+        ("matrix of '%3B'", "/a" + "%3B" * (_BIG // 3) + "token%3D1"),
+        ("matrix of '%3'", "/a;" + "%3" * (_BIG // 2) + "=1"),
+        ("matrix values", "/a" + ";t=1" * (_BIG // 4)),
+        ("long value", f"/x?token={'A' * _BIG}"),
+]
+
+
+@pytest.mark.parametrize("label, text", _LINEAR_CASES, ids=[c[0] for c in _LINEAR_CASES])
+def test_redaction_is_linear_on_long_adversarial_input(label, text):
+    best = min(_timed(redact_query_params, text) for _ in range(3))
+    assert best < 0.5, f"{label}: {best:.3f}s"
+    # and through the filter, as uvicorn's access logger calls it
+    record = _access_record(text)
+    assert _timed(QueryParamRedactionFilter().filter, record) < 0.5
+
+
+def _timed(fn, arg):
+    t0 = time.perf_counter()
+    fn(arg)
+    return time.perf_counter() - t0
+
+
+def test_array_suffix_still_detected_after_h1_fix():
+    for name in ("token[]", "token[0]", "token%5B%5D", "api_key[]", "TOKEN[x]"):
+        assert redact_query_params(f"/x?{name}={FAKE}") == f"/x?{name}={MASK}"
+
+
+def test_filter_runs_once_per_access_record_with_main_wiring(monkeypatch):
+    """main.main() wiring = install_log_redaction() + uvicorn's dictConfig of
+    uvicorn_log_config(): an access record must pass the filter exactly once
+    (it ran 3 times before the H1 fix)."""
+    import uvicorn
+
+    calls = []
+    original = QueryParamRedactionFilter.filter
+
+    def counting(self, record):
+        calls.append(record)
+        return original(self, record)
+
+    monkeypatch.setattr(QueryParamRedactionFilter, "filter", counting)
+    access = logging.getLogger("uvicorn.access")
+    install_log_redaction()
+    uvicorn.Config(app=lambda *a: None, log_config=uvicorn_log_config(), log_level="info")
+    sink = io.StringIO()
+    extra = logging.StreamHandler(sink)
+    access.addHandler(extra)
+    try:
+        access.info('%s - "%s %s HTTP/%s" %d', "127.0.0.1:1", "GET", f"/x?token={FAKE}", "1.1", 200)
+        assert len(calls) == 1
+        assert FAKE not in sink.getvalue()
+    finally:
+        access.removeHandler(extra)
+        access.filters[:] = [f for f in access.filters if not isinstance(f, QueryParamRedactionFilter)]
+        for h in logging.getLogger().handlers:
+            h.filters[:] = [f for f in h.filters if not isinstance(f, QueryParamRedactionFilter)]
